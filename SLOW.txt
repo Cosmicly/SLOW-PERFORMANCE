@@ -1,0 +1,170 @@
+WITH latest_reply AS (   -- MATERIALIZE: one recent, still-open reply per order BEFORE touching the 6.1M-row ORDERS table
+  SELECT /*+ MATERIALIZE */ order_id, event_time, station_response_status_ids
+    FROM ( SELECT sr.order_id, sr.event_time, sr.station_response_status_ids,
+                  ROW_NUMBER() OVER (PARTITION BY sr.order_id ORDER BY sr.event_time DESC) AS rn
+             FROM station_reply sr
+            WHERE sr.event_time >= SYSDATE - 7 )     -- range-scans IDX_STATION_REPLY_EVENT_TIME
+   WHERE rn = 1
+     AND event_time <= SYSDATE - 8/24                -- latest reply must be at least 8h old
+     AND INSTR(station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_CONFIRMED) = 0
+)
+SELECT * FROM (
+SELECT /*+ LEADING(str ord) USE_NL(ord) */
+       ord.order_nr, ord.order_id, ord.prj_alternate_lou_code, ord.loading_unit_code,
+       ord.sheet_nr, ord.DELIVERY_DATE,
+       lu.lut.to_token(ord.loading_unit_type_id) AS load_carrier,
+       lu.coi.to_token(ord.last_control_info_id) AS control_info,
+       lu.sta.to_token(ord.last_read_station_id) AS station_divert,
+       TO_CHAR(str.event_time, 'DD-MON-YY HH.MI.SSXFF PM') AS event_time,
+       (SELECT LISTAGG(lu.sta.to_token(pri.station_id), ', ') WITHIN GROUP (ORDER BY pri.target_station_priority)
+          FROM PRJ_STATION_PRIORITY pri
+         WHERE pri.order_id = ord.order_id) AS target_station_prios,
+       CASE WHEN INSTR((SELECT LISTAGG(lu.sta.to_token(pri.station_id), ', ') WITHIN GROUP (ORDER BY pri.target_station_priority)
+                        FROM PRJ_STATION_PRIORITY pri
+                        WHERE pri.order_id = ord.order_id), lu.sta.to_token(ord.last_read_station_id)) > 0 
+            THEN 'Y' ELSE 'N' END AS divert_matches_prio,
+       CASE WHEN INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_CONFIRMED) > 0 THEN 'PRJ_SORTER_DISCHARGE_CONFIRMED'
+            WHEN INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_FAILED)    > 0 THEN 'PRJ_SORTER_DISCHARGE_FAILED'
+            WHEN INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_TO_ERROR)  > 0 THEN 'PRJ_SORTER_DISCHARGE_TO_ERROR'
+            WHEN INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_ATTEMPT)   > 0 THEN 'PRJ_SORTER_DISCHARGE_ATTEMPT'
+        ELSE NULL END AS last_sorter_status,
+       CASE WHEN INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_CONFIRMED) > 0
+            THEN 'GOOD UDC + 32R'
+            WHEN lu.sta.to_token(ord.last_read_station_id) LIKE '%BIAR%'
+            THEN 'DISSAPPEARED NO MESSAGE GETTING ON SORTER'
+            WHEN INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_ATTEMPT)   > 0
+             AND INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_CONFIRMED) = 0
+             AND INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_FAILED)    = 0
+             AND INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_TO_ERROR)  = 0
+            THEN 'DISSAPPEARED NO BEUMER UDC'
+            WHEN INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_FAILED)    > 0
+             AND INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_CONFIRMED) = 0
+            THEN 'DISSAPPEARED AFTER FAILED DIVERT'
+            WHEN NVL(INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_CONFIRMED), 0) = 0
+             AND NVL(INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_FAILED),    0) = 0
+             AND NVL(INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_TO_ERROR),  0) = 0
+             AND NVL(INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_ATTEMPT),   0) = 0
+             AND lu.lut.to_token(ord.loading_unit_type_id) IN ('SHIPPINGCARTON', 'BAG') AND ord.sheet_nr > 500
+            THEN 'DISSAPPEARED AT JACKPOT'
+            WHEN lu.sta.to_token(ord.last_read_station_id) IN ('%CONS01F2LAAP001%', 'CONS01F2ERRO001')
+            THEN 'DISSAPPEARED AT CONSOLIDATION'
+            WHEN lu.sta.to_token(ord.last_read_station_id) LIKE 'SLA%READ%'
+             AND INSTR(ord.order_nr, '_') > 0
+             AND SUBSTR(ord.order_nr, INSTR(ord.order_nr, '_') + 1) <> '1'
+             AND EXISTS ( SELECT 1 FROM orders o1 JOIN station_reply s1 ON s1.order_id = o1.order_id
+                           WHERE o1.order_nr = SUBSTR(ord.order_nr, 1, INSTR(ord.order_nr, '_') - 1) || '_1'
+                             AND o1.order_id <> ord.order_id AND o1.sheet_nr <= 500
+                             AND INSTR(s1.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_CONFIRMED) > 0 )
+            THEN 'SLAM KICKOUT PREMATURE RESHOP'
+            WHEN lu.sta.to_token(ord.last_read_station_id) LIKE 'SLA%READ%'
+            THEN 'DISSAPPEARED AT SLAM'
+            WHEN lu.sta.to_token(ord.last_read_station_id) LIKE '%BAGG%'
+            THEN 'DISSAPPEARED AT BAGGING'
+            WHEN lu.sta.to_token(ord.last_read_station_id) IN ('OUTB01F1SCAN002', 'OUTB01F1SCAN001')
+            THEN 'DISSAPPEARED ON RECIRC'
+            WHEN lu.sta.to_token(ord.last_read_station_id) LIKE 'IFM%EXIT%'
+            THEN 'BEFORE SLAM DISSAPPEARED AT CACL EXIT'
+            WHEN lu.sta.to_token(ord.last_read_station_id) LIKE 'OUT%BEIF%'
+            THEN 'DISSAPPEARED AT SORTER INFEED'
+         ELSE NULL END AS categorization
+  FROM latest_reply str
+  JOIN orders ord ON ord.order_id = str.order_id           -- NL into ORDERS by order_id (no full scan)
+    WHERE lu.lut.to_token(ord.loading_unit_type_id) NOT IN ('FULL', 'RECCARTON')
+      --OR ( INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_ATTEMPT)   > 0
+      -- AND INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_CONFIRMED) = 0
+      -- AND INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_FAILED)    = 0
+      -- AND INSTR(str.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_TO_ERROR)  = 0 ) )
+    --AND lu.sta.to_token(ord.last_read_station_id) LIKE 'DEC%DECA%'
+    AND ord.process_status_id >= 50
+    AND lu.ops.to_token(ord.process_status_id) NOT IN ('CANCELLED')
+    AND NOT EXISTS ( SELECT 1 FROM orders succ JOIN station_reply sr2 ON sr2.order_id = succ.order_id
+                     WHERE SUBSTR( succ.order_nr, 1, INSTR(succ.order_nr, '_') - 1 )
+                         = SUBSTR( ord.order_nr,  1, INSTR(ord.order_nr,  '_') - 1 )
+                       AND succ.order_id <> ord.order_id AND succ.sheet_nr > 500
+                       AND INSTR( sr2.station_response_status_ids, lu.srs.PRJ_SORTER_DISCHARGE_CONFIRMED ) > 0 )
+ORDER BY str.event_time DESC )
+WHERE categorization LIKE '%DISSAP%'
+    OR categorization = 'SLAM KICKOUT PREMATURE RESHOP';
+
+
+
+
+Plan hash value: 2220645099
+ 
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                | Name                        | Rows  | Bytes |TempSpc| Cost (%CPU)| Time     |    TQ  |IN-OUT| PQ Distrib |
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                         |                             |  1702 |    13M|       |    78M  (1)| 00:50:57 |        |      |            |
+|   1 |  SORT GROUP BY                           |                             |     1 |    15 |       |            |          |        |      |            |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED    | PRJ_STATION_PRIORITY        |     4 |    60 |       |     4   (0)| 00:00:01 |        |      |            |
+|*  3 |    INDEX RANGE SCAN                      | PK_PRJ_STATION_PRIORITY     |     4 |       |       |     3   (0)| 00:00:01 |        |      |            |
+|   4 |  SORT GROUP BY                           |                             |     1 |    15 |       |            |          |        |      |            |
+|   5 |   TABLE ACCESS BY INDEX ROWID BATCHED    | PRJ_STATION_PRIORITY        |     4 |    60 |       |     4   (0)| 00:00:01 |        |      |            |
+|*  6 |    INDEX RANGE SCAN                      | PK_PRJ_STATION_PRIORITY     |     4 |       |       |     3   (0)| 00:00:01 |        |      |            |
+|   7 |  NESTED LOOPS                            |                             |     1 |    37 |       |    19   (0)| 00:00:01 |        |      |            |
+|   8 |   NESTED LOOPS                           |                             |    13 |    37 |       |    19   (0)| 00:00:01 |        |      |            |
+|*  9 |    TABLE ACCESS BY INDEX ROWID BATCHED   | ORDERS                      |     1 |    26 |       |     4   (0)| 00:00:01 |        |      |            |
+|* 10 |     INDEX RANGE SCAN                     | IDX_TRO_ORDER_NR_SHEET_NR   |     1 |       |       |     3   (0)| 00:00:01 |        |      |            |
+|* 11 |    INDEX RANGE SCAN                      | IDX_STATION_REPLY__ORDER_ID |    13 |       |       |     3   (0)| 00:00:01 |        |      |            |
+|* 12 |   TABLE ACCESS BY INDEX ROWID            | STATION_REPLY               |     1 |    11 |       |    15   (0)| 00:00:01 |        |      |            |
+|  13 |  TEMP TABLE TRANSFORMATION               |                             |       |       |       |            |          |        |      |            |
+|  14 |   LOAD AS SELECT (CURSOR DURATION MEMORY)| SYS_TEMP_0FD9DEBAE_4E8ECED6 |       |       |       |            |          |        |      |            |
+|* 15 |    VIEW                                  |                             |    46M|    12G|       |  1098K  (1)| 00:00:43 |        |      |            |
+|* 16 |     WINDOW SORT PUSHED RANK              |                             |    46M|   984M|  1437M|  1098K  (1)| 00:00:43 |        |      |            |
+|* 17 |      TABLE ACCESS FULL                   | STATION_REPLY               |    46M|   984M|       |   786K  (2)| 00:00:31 |        |      |            |
+|* 18 |   VIEW                                   |                             |  1702 |    13M|       |    77M  (1)| 00:50:14 |        |      |            |
+|  19 |    SORT ORDER BY                         |                             |  1702 |   696K|       |    77M  (1)| 00:50:14 |        |      |            |
+|* 20 |     HASH JOIN ANTI                       |                             |  1702 |   696K|       |    77M  (1)| 00:50:14 |        |      |            |
+|  21 |      NESTED LOOPS                        |                             |  1702 |   565K|       |    76M  (1)| 00:49:40 |        |      |            |
+|  22 |       NESTED LOOPS                       |                             |    46M|   565K|       |    76M  (1)| 00:49:40 |        |      |            |
+|  23 |        VIEW                              |                             |    46M|    12G|       |   512K  (1)| 00:00:21 |        |      |            |
+|  24 |         TABLE ACCESS FULL                | SYS_TEMP_0FD9DEBAE_4E8ECED6 |    46M|   984M|       |   512K  (1)| 00:00:21 |        |      |            |
+|* 25 |        INDEX UNIQUE SCAN                 | PK_ORDERS                   |     1 |       |       |     1   (0)| 00:00:01 |        |      |            |
+|* 26 |       TABLE ACCESS BY INDEX ROWID        | ORDERS                      |     1 |    62 |       |     2   (0)| 00:00:01 |        |      |            |
+|  27 |      VIEW                                | VW_SQ_1                     |   856K|    64M|       |   852K  (3)| 00:00:34 |        |      |            |
+|* 28 |       HASH JOIN                          |                             |   856K|    30M|    34M|   852K  (3)| 00:00:34 |        |      |            |
+|  29 |        PX COORDINATOR                    |                             |       |       |       |            |          |        |      |            |
+|  30 |         PX SEND QC (RANDOM)              | :TQ10002                    |   939K|    23M|       | 40796   (1)| 00:00:02 |  Q1,02 | P->S | QC (RAND)  |
+|  31 |          VIEW                            | index$_join$_012            |   939K|    23M|       | 40796   (1)| 00:00:02 |  Q1,02 | PCWP |            |
+|* 32 |           HASH JOIN BUFFERED             |                             |       |       |       |            |          |  Q1,02 | PCWP |            |
+|  33 |            PX RECEIVE                    |                             |   939K|    23M|       | 32095   (1)| 00:00:02 |  Q1,02 | PCWP |            |
+|  34 |             PX SEND HASH                 | :TQ10000                    |   939K|    23M|       | 32095   (1)| 00:00:02 |  Q1,00 | P->P | HASH       |
+|  35 |              PX BLOCK ITERATOR           |                             |   939K|    23M|       | 32095   (1)| 00:00:02 |  Q1,00 | PCWC |            |
+|* 36 |               INDEX FAST FULL SCAN       | IDX_TRO_ORDER_NR_SHEET_NR   |   939K|    23M|       | 32095   (1)| 00:00:02 |  Q1,00 | PCWP |            |
+|  37 |            PX RECEIVE                    |                             |   939K|    23M|       | 18833   (1)| 00:00:01 |  Q1,02 | PCWP |            |
+|  38 |             PX SEND HASH                 | :TQ10001                    |   939K|    23M|       | 18833   (1)| 00:00:01 |  Q1,01 | P->P | HASH       |
+|  39 |              PX BLOCK ITERATOR           |                             |   939K|    23M|       | 18833   (1)| 00:00:01 |  Q1,01 | PCWC |            |
+|  40 |               INDEX FAST FULL SCAN       | PK_ORDERS                   |   939K|    23M|       | 18833   (1)| 00:00:01 |  Q1,01 | PCWP |            |
+|* 41 |        TABLE ACCESS FULL                 | STATION_REPLY               |  9438K|    99M|       |   799K  (3)| 00:00:32 |        |      |            |
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+ 
+Predicate Information (identified by operation id):
+---------------------------------------------------
+ 
+   3 - access("PRI"."ORDER_ID"=:B1)
+   6 - access("PRI"."ORDER_ID"=:B1)
+   9 - filter("O1"."ORDER_ID"<>:B1)
+  10 - access("O1"."ORDER_NR"=SUBSTR(:B1,1,INSTR(:B2,'_')-1)||'_1' AND "O1"."SHEET_NR"<=500)
+  11 - access("S1"."ORDER_ID"="O1"."ORDER_ID")
+       filter("S1"."ORDER_ID"<>:B1)
+  12 - filter(INSTR("S1"."STATION_RESPONSE_STATUS_IDS",TO_CHAR("SRS"."PRJ_SORTER_DISCHARGE_CONFIRMED"()))>0)
+  15 - filter("RN"=1 AND "EVENT_TIME"<=SYSDATE@!-.3333333333333333333333333333333333333333 AND 
+              INSTR("STATION_RESPONSE_STATUS_IDS",TO_CHAR("SRS"."PRJ_SORTER_DISCHARGE_CONFIRMED"()))=0)
+  16 - filter(ROW_NUMBER() OVER ( PARTITION BY "SR"."ORDER_ID" ORDER BY INTERNAL_FUNCTION("SR"."EVENT_TIME") DESC )<=1)
+  17 - filter("SR"."EVENT_TIME">=SYSDATE@!-7)
+  18 - filter("CATEGORIZATION" LIKE '%DISSAP%' AND "CATEGORIZATION" IS NOT NULL AND "CATEGORIZATION" IS NOT NULL OR "CATEGORIZATION"='SLAM KICKOUT 
+              PREMATURE RESHOP')
+  20 - access("ITEM_1"=SUBSTR("ORD"."ORDER_NR",1,INSTR("ORD"."ORDER_NR",'_')-1))
+       filter("ITEM_2"<>"ORD"."ORDER_ID")
+  25 - access("ORD"."ORDER_ID"="STR"."ORDER_ID")
+  26 - filter("ORD"."PROCESS_STATUS_ID">=50 AND "LUT"."TO_TOKEN"("ORD"."LOADING_UNIT_TYPE_ID")<>'FULL' AND 
+              "LUT"."TO_TOKEN"("ORD"."LOADING_UNIT_TYPE_ID")<>'RECCARTON' AND "OPS"."TO_TOKEN"("ORD"."PROCESS_STATUS_ID")<>'CANCELLED')
+  28 - access("SR2"."ORDER_ID"="SUCC"."ORDER_ID")
+  32 - access(ROWID=ROWID)
+  36 - filter("SUCC"."SHEET_NR">500)
+  41 - filter("SR2"."ORDER_ID" IS NOT NULL AND INSTR("SR2"."STATION_RESPONSE_STATUS_IDS",TO_CHAR("SRS"."PRJ_SORTER_DISCHARGE_CONFIRMED"()))>0)
+ 
+Note
+-----
+   - this is an adaptive plan
+    
